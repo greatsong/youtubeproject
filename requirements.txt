@@ -1,1 +1,6 @@
+# requirements.txt
+streamlit
 requests
+pandas
+soynlp
+altair
