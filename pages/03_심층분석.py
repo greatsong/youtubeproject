@@ -3,42 +3,18 @@ import streamlit as st
 import requests
 from urllib.parse import urlparse, parse_qs
 import re
-from collections import Counter
-from typing import Optional, List
 import pandas as pd
 import altair as alt
 
 # ---------------------------- 기본 설정 ----------------------------
-st.set_page_config(page_title="유튜브 댓글 단어 빈도 분석", layout="wide")
-st.title("유튜브 댓글 단어 빈도 분석")
-st.caption("주소를 넣고 댓글을 인기순으로 모아서, 단어를 뽑아 상위 20개를 그래프로 보여줘요.")
+st.set_page_config(page_title="유튜브 댓글 시간 분석기", layout="wide")
+st.title("유튜브 댓글 시간 분석기")
+st.caption("주소를 넣고 버튼을 누르면 업로드일을 확인하고, 댓글을 인기순으로 모아 시간 기반 그래프를 보여줘요.")
 
 DEFAULT_URL = "https://www.youtube.com/watch?v=WXuK6gekU1Y"
 
-# ---------------------------- 불용어 목록(간단) ----------------------------
-STOP_EN = {
-    "a","an","the","and","or","but","if","then","else","for","with","about","into","over","after","before","between","under",
-    "to","of","in","on","at","by","as","from","up","down","out","off","than","so","too","very","just","only","also","not",
-    "no","nor","all","any","both","each","few","more","most","other","some","such","own","same","once","ever","never","can",
-    "will","would","could","should","is","am","are","was","were","be","been","being","do","does","did","doing","don","doesn",
-    "didn","i","you","he","she","it","we","they","me","my","mine","your","yours","our","ours","their","theirs","this","that",
-    "these","those","here","there","when","where","why","how"
-}
-STOP_KO = {
-    "그리고","그러나","하지만","그래서","또한","및","등","등등","또","아니라","보다","위해","대한","때문","때문에","으로","으로써","으로서",
-    "에서","에게","에게서","부터","까지","하다","한다","했다","하는","한","하면","하며","하여","하니","하고","돼","된다","되는","되어","됐다",
-    "되다","이다","입니다","있는","있다","없다","같다","거","것","수","들","그","이","저","그것","이것","저것","때","일","좀","등등","자",
-    "너무","정말","매우","많이","많다","더","또는","만","라도","에게로","까지도","에서의","에서만","부터도","에는","에는가","이며","이나","이나요",
-    "요","네","죠","거의","현재","영상","댓글","유튜브","보기","저희","여러분","오늘","진짜","근데","그냥","아마","이미","다시","다른","최근",
-    "처럼","같이","우리","제가","너가","니가","제가요","내가","제가요","그게","이게","저게","때가","때는","때에"
-}
-STOP_ETC = {
-    "https","http","www","com","net","org","kr","co","youtu","youtube","watch","video","amp"
-}
-STOPWORDS = {w.lower() for w in (STOP_EN | STOP_KO | STOP_ETC | {"ㅋㅋ","ㅎㅎ","ㅠㅠ","ㅜㅜ","ㅠ","ㅜ"})}
-
-# ---------------------------- 도우미 함수들 ----------------------------
-def extract_video_id(url: str) -> Optional[str]:
+# ---------------------------- 유틸리티 ----------------------------
+def extract_video_id(url: str):
     """여러 형태의 유튜브 주소에서 영상 ID를 뽑아줘요."""
     if not url:
         return None
@@ -76,6 +52,7 @@ def extract_video_id(url: str) -> Optional[str]:
         if m:
             return m.group(1)
 
+    # 예외적으로 query에 vi=가 올 때
     if "vi" in qs and qs["vi"]:
         return qs["vi"][0]
     return None
@@ -93,87 +70,177 @@ def raise_api_error(resp: requests.Response) -> None:
     raise RuntimeError(f"{code}:{reason}")
 
 
-@st.cache_data(show_spinner=False, ttl=600)
-def fetch_comment_texts(api_key: str, video_id: str, limit: Optional[int]) -> List[str]:
-    """인기순으로 댓글 본문만 모아줘요. limit가 None이면 가능한 만큼 모두 모아요."""
+@st.cache_resource(show_spinner=False)
+def get_http_session() -> requests.Session:
+    """유튜브 API 호출용 세션을 한 번 만들고 재사용해요."""
+    s = requests.Session()
+    s.headers.update({"Accept": "application/json"})
+    return s
+
+
+def get_video_published_at(api_key: str, video_id: str, session: requests.Session) -> str:
+    """영상 업로드 시각(ISO8601, UTC)을 가져와요."""
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {"id": video_id, "part": "snippet", "key": api_key}
+    resp = session.get(url, params=params, timeout=20)
+    if resp.status_code != 200:
+        raise_api_error(resp)
+    data = resp.json()
+    items = data.get("items", [])
+    if not items:
+        raise RuntimeError("404:notFound")
+    return items[0]["snippet"]["publishedAt"]  # 예: '2020-01-01T12:34:56Z'
+
+
+def fetch_comments(api_key: str, video_id: str, session: requests.Session, limit: int | None):
+    """인기순 댓글을 모아와요. limit가 None이면 가능한 만큼 모두 모아요."""
     url = "https://www.googleapis.com/youtube/v3/commentThreads"
     params = {
         "part": "snippet",
         "videoId": video_id,
         "key": api_key,
         "order": "relevance",       # 인기순
-        "maxResults": 100,          # 한 번에 최대
-        "textFormat": "plainText",  # 본문만 받을게요
+        "maxResults": 100,
+        "textFormat": "plainText",  # 본문만
     }
-    texts: List[str] = []
+    items = []
     page_token = None
-
     while True:
         if page_token:
             params["pageToken"] = page_token
         else:
             params.pop("pageToken", None)
 
-        resp = requests.get(url, params=params, timeout=20)
+        resp = session.get(url, params=params, timeout=20)
         if resp.status_code != 200:
             raise_api_error(resp)
 
         data = resp.json()
-        for it in data.get("items", []):
-            try:
-                top = it["snippet"]["topLevelComment"]["snippet"]
-                txt = top.get("textDisplay", "")
-                txt = txt.replace("\n", " ").strip()
-                if txt:
-                    texts.append(txt)
-            except Exception:
-                continue
-            if isinstance(limit, int) and len(texts) >= limit:
-                return texts
+        items.extend(data.get("items", []))
+        if isinstance(limit, int) and len(items) >= limit:
+            items = items[:limit]
+            break
 
         page_token = data.get("nextPageToken")
         if not page_token:
             break
+    return items
 
-    return texts
+
+def build_dataframe(items):
+    """표로 보여줄 데이터프레임을 만들어요. 시간은 KST로 변환해요."""
+    rows = []
+    for it in items:
+        try:
+            sn = it["snippet"]["topLevelComment"]["snippet"]
+            text = (sn.get("textDisplay", "") or "").replace("\n", " ").strip()
+            published_at = sn.get("publishedAt", "")
+            like_count = int(sn.get("likeCount", 0))
+            rows.append(
+                {
+                    "댓글 내용": text,
+                    "작성 시각": published_at,  # 일단 문자열(UTC)
+                    "좋아요 수": like_count,
+                }
+            )
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows, columns=["댓글 내용", "작성 시각", "좋아요 수"])
+    if df.empty:
+        return df
+
+    # pandas.to_datetime으로 UTC -> KST(+9) 변환
+    # publishedAt는 보통 Z(UTC) 포맷이므로 utc=True로 파싱한 뒤 tz_convert
+    df["작성 시각"] = pd.to_datetime(df["작성 시각"], utc=True).dt.tz_convert("Asia/Seoul")
+    return df
 
 
-@st.cache_data(show_spinner=False, ttl=600)
-def count_top_words(texts: List[str], topk: int = 20) -> pd.DataFrame:
-    """댓글에서 단어를 뽑고(soynlp), 소문자/2글자 이상/불용어 제거 후 상위 topk를 돌려줘요."""
-    from soynlp.tokenizer import RegexTokenizer
-    regex_tok = RegexTokenizer()
+def make_cumulative_chart(df: pd.DataFrame, upload_kst: pd.Timestamp):
+    """시간순 누적선과 1주일 내 최대 증가 시점(빨간 점선)을 그려요."""
+    # 시간순 정렬 및 누적 개수 계산
+    d = df.sort_values("작성 시각").copy()
+    d["누적 개수"] = range(1, len(d) + 1)
 
-    all_tokens: List[str] = []
-    for t in texts:
-        # 1차: soynlp 토크나이저
-        toks = regex_tok.tokenize(t)
-        refined = []
-        for tok in toks:
-            tok = tok.lower()
-            # 한글/영문/숫자만 남겨요
-            m = re.fullmatch(r"[가-힣a-z0-9]+", tok)
-            if not m:
-                continue
-            if len(tok) < 2:
-                continue
-            if tok in STOPWORDS:
-                continue
-            refined.append(tok)
+    base = (
+        alt.Chart(d)
+        .mark_line()
+        .encode(
+            x=alt.X("작성 시각:T", title="시간"),
+            y=alt.Y("누적 개수:Q", title="누적 개수"),
+            tooltip=[alt.Tooltip("작성 시각:T", title="시간"), alt.Tooltip("누적 개수:Q", title="누적")]
+        )
+    )
 
-        # 보조: 너무 걸러졌다면 간단 규칙으로 추가 추출
-        if not refined:
-            extra = re.findall(r"[가-힣a-z0-9]+", t.lower())
-            refined = [w for w in extra if len(w) >= 2 and w not in STOPWORDS]
+    # 업로드일 기준 7일 구간에서 시간대(1시간)별 증가량 계산
+    seven_days_end = upload_kst + pd.Timedelta(days=7)
+    d7 = d[(d["작성 시각"] >= upload_kst) & (d["작성 시각"] < seven_days_end)].copy()
 
-        all_tokens.extend(refined)
+    rule_layer = None
+    if not d7.empty:
+        # 시간 단위로 리샘플해서 해당 시간에 새로 달린 댓글 수(증가량) 계산
+        hourly = (
+            d7.set_index("작성 시각")
+            .resample("H")["누적 개수"]
+            .count()  # 해당 시간 구간에 추가된 개수
+        )
 
-    if not all_tokens:
-        return pd.DataFrame(columns=["단어", "빈도"])
+        if hourly.sum() > 0:
+            max_hour = hourly.idxmax()  # 증가가 가장 큰 시각(시간 구간의 시작)
+            rule_layer = (
+                alt.Chart(pd.DataFrame({"x": [max_hour]}))
+                .mark_rule(color="red", strokeDash=[6, 4])
+                .encode(x="x:T")
+            )
 
-    freq = Counter(all_tokens)
-    most = freq.most_common(topk)
-    return pd.DataFrame(most, columns=["단어", "빈도"])
+    return base if rule_layer is None else base + rule_layer
+
+
+def make_scatter_likes(df: pd.DataFrame):
+    """작성 시각 ↔ 좋아요 수 산점도"""
+    chart = (
+        alt.Chart(df)
+        .mark_point()
+        .encode(
+            x=alt.X("작성 시각:T", title="시간"),
+            y=alt.Y("좋아요 수:Q", title="좋아요 수"),
+            tooltip=[alt.Tooltip("작성 시각:T", title="시간"), alt.Tooltip("좋아요 수:Q", title="좋아요 수"), alt.Tooltip("댓글 내용:N", title="댓글")],
+        )
+    )
+    return chart
+
+
+def make_hourly_like_barchart(df: pd.DataFrame):
+    """시간대(시)별 좋아요 수 합계 막대그래프"""
+    d = df.copy()
+    d["시간대"] = d["작성 시각"].dt.hour
+    agg = d.groupby("시간대", as_index=False)["좋아요 수"].sum().sort_values("시간대")
+    chart = (
+        alt.Chart(agg)
+        .mark_bar()
+        .encode(
+            x=alt.X("시간대:O", title="시간대(시)"),
+            y=alt.Y("좋아요 수:Q", title="좋아요 수 합계"),
+            tooltip=["시간대", "좋아요 수"],
+        )
+    )
+    return chart
+
+
+def make_hourly_like_boxplot(df: pd.DataFrame):
+    """시간대별 좋아요 분포(박스플롯)"""
+    d = df.copy()
+    d["시간대"] = d["작성 시각"].dt.hour
+    chart = (
+        alt.Chart(d)
+        .mark_boxplot()
+        .encode(
+            x=alt.X("시간대:O", title="시간대(시)"),
+            y=alt.Y("좋아요 수:Q", title="좋아요 수 분포"),
+            tooltip=["시간대"]
+        )
+    )
+    return chart
 
 
 # ---------------------------- 화면 ----------------------------
@@ -191,9 +258,9 @@ col1, col2, col3 = st.columns([1, 1, 1.2])
 with col1:
     quick = st.radio("빠른 선택", options=["100", "500", "1000", "모두"], horizontal=True, index=0)
 with col2:
-    slider_val = st.slider("슬라이더(100~1000, 100단위)", 100, 1000, 500, step=100)
+    slider_val = st.slider("슬라이더(100~1000, 100단위)", min_value=100, max_value=1000, step=100, value=500)
 with col3:
-    fetch_btn = st.button("댓글 가져와서 분석하기", disabled=(not bool(api_key)))
+    fetch_btn = st.button("업로드일 확인 후 댓글 모으기", disabled=(not bool(api_key)))
 
 # 버튼을 누르기 전에는 어떤 연결도 시도하지 않아요.
 if fetch_btn:
@@ -202,7 +269,7 @@ if fetch_btn:
         st.error("주소가 올바르지 않아요.")
         st.stop()
 
-    # 실제 개수는 두 값 중 큰 값, 단 '모두'면 제한 없이 가져와요.
+    # 실제 개수는 두 값 중 큰 값, 단 '모두'면 가능한 만큼
     if quick == "모두":
         limit = None
     else:
@@ -212,9 +279,29 @@ if fetch_btn:
             quick_n = 100
         limit = max(quick_n, slider_val)
 
+    session = get_http_session()
+
+    # 업로드일(UTC) 가져오기
+    try:
+        published_utc = get_video_published_at(api_key, video_id, session)
+    except RuntimeError:
+        st.error("데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+        st.stop()
+    except Exception:
+        st.error("데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+        st.stop()
+
+    # 업로드일을 pandas로 파싱하고 KST로 변환
+    try:
+        upload_kst = pd.to_datetime(published_utc, utc=True).tz_convert("Asia/Seoul")
+    except Exception:
+        st.error("데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+        st.stop()
+
+    # 댓글 모으기
     with st.spinner("댓글을 모으는 중이에요..."):
         try:
-            texts = fetch_comment_texts(api_key, video_id, limit)
+            items = fetch_comments(api_key, video_id, session, limit)
         except RuntimeError as e:
             msg = str(e)
             if ("403" in msg and ("commentsDisabled" in msg or "forbidden" in msg)) or "commentsDisabled" in msg:
@@ -223,32 +310,34 @@ if fetch_btn:
             if "quotaExceeded" in msg or "429" in msg:
                 st.error("오늘 사용할 수 있는 조회량이 다 됐어요.")
                 st.stop()
-            st.error("댓글을 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+            st.error("데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
             st.stop()
         except Exception:
-            st.error("댓글을 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+            st.error("데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
             st.stop()
 
-    if not texts:
+    df = build_dataframe(items)
+    if df.empty:
         st.info("가져올 댓글이 없어요.")
         st.stop()
 
-    df_top = count_top_words(texts, topk=20)
-    if df_top.empty:
-        st.info("단어를 뽑을 수 없었어요.")
-        st.stop()
+    # 표 보여주기
+    st.subheader("댓글 표")
+    st.dataframe(df[["댓글 내용", "작성 시각", "좋아요 수"]], use_container_width=True)
 
-    st.subheader("상위 20개 단어 - 기본 막대그래프")
-    st.bar_chart(df_top.set_index("단어"), use_container_width=True)
+    # 누적선 + 1주일 내 최대 증가 시점 표시
+    st.subheader("시간순 누적선 (빨간 점선: 1주일 내 최대 증가 시점)")
+    cum_chart = make_cumulative_chart(df, upload_kst)
+    st.altair_chart(cum_chart, use_container_width=True)
 
-    st.subheader("상위 20개 단어 - Altair 막대그래프")
-    chart = (
-        alt.Chart(df_top)
-        .mark_bar()
-        .encode(
-            x=alt.X("단어:N", sort="-y", title="단어"),
-            y=alt.Y("빈도:Q", title="빈도"),
-            tooltip=["단어", "빈도"],
-        )
-    )
-    st.altair_chart(chart, use_container_width=True)
+    # 작성 시각 ↔ 좋아요 수 산점도
+    st.subheader("작성 시각 ↔ 좋아요 수 (산점도)")
+    st.altair_chart(make_scatter_likes(df), use_container_width=True)
+
+    # 시간대(시)별 좋아요 수 합계
+    st.subheader("시간대(시)별 좋아요 수 합계")
+    st.altair_chart(make_hourly_like_barchart(df), use_container_width=True)
+
+    # 시간대별 좋아요 분포(박스플롯)
+    st.subheader("시간대별 좋아요 분포(박스플롯)")
+    st.altair_chart(make_hourly_like_boxplot(df), use_container_width=True)
