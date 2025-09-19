@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 
 # 페이지 설정 (가장 먼저 실행)
@@ -47,4 +46,3 @@ st.markdown("⚠️ **API 키는 외부에 노출되지 않도록 꼭 주의하�
 st.markdown("---")
 st.markdown("## 🚀 시작 안내")
 st.markdown("👉 왼쪽 사이드바에서 원하는 분석기(댓글 수집/빈도/불용어/심층/워드클라우드)를 선택하세요.")
-```
