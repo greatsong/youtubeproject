@@ -362,7 +362,7 @@ if submit:
 
     # 화면 표시
     st.success("✅ 워드클라우드를 만들었어요!")
-    st.image(img_buf, caption="워드클라우드", use_column_width=True)
+    st.image(img_buf, caption="워드클라우드", use_container_width=True)
 
     # 파일명 정리 후 다운로드 버튼 제공
     clean_title = sanitize_filename(title)
