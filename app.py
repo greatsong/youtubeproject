@@ -24,7 +24,7 @@ st.markdown("- 결과를 **표/그래프**로 깔끔하게 확인")
 st.markdown("---")
 
 # 3) YouTube API Key 발급 안내 (6단계 + 스트림릿 시크릿 예시)
-st.markdown("#### 🔑 YouTube API Key 발급 안내 (간단 6단계)")
+st.markdown("#### 🔑 YouTube API Key 발급 안내")
 st.markdown("1. [Google Cloud Console](https://console.cloud.google.com/) 에 접속해요.")
 st.markdown("2. 새 **프로젝트**를 만들거나 기존 프로젝트를 선택해요.")
 st.markdown("3. **APIs & Services → Library**에서 **YouTube Data API v3**를 검색해요.")
