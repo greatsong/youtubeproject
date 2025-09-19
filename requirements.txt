@@ -3,3 +3,5 @@ streamlit
 requests
 wordcloud
 matplotlib
+soynlp
+
