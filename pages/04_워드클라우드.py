@@ -4,23 +4,42 @@ import requests
 from urllib.parse import urlparse, parse_qs
 import re
 from collections import Counter
+import pandas as pd
+import altair as alt
 from io import BytesIO
-import tempfile
-import os
-import matplotlib.pyplot as plt
-from matplotlib import font_manager
 from wordcloud import WordCloud, STOPWORDS as WC_STOPWORDS
+import matplotlib.pyplot as plt
+import os
+import tempfile
 
-# ============================ 페이지 설정 ============================
-st.set_page_config(page_title="🎈 유튜브 댓글 워드클라우드", layout="wide")
-st.title("🎈 유튜브 댓글 워드클라우드")
-st.caption("🧩 주소를 넣고 최대 댓글 수를 고른 뒤 버튼을 눌러 워드클라우드를 만들어봐요.")
+# ---------------------------- 페이지 설정 ----------------------------
+st.set_page_config(page_title="🧩 유튜브 댓글 워드클라우드", layout="wide")
+st.title("🧩 유튜브 댓글 워드클라우드")
+st.caption("🔗 주소와 옵션을 넣고 ▶ 버튼을 눌러 워드클라우드를 만들어 보세요!")
 
+# ---------------------------- 기본값 및 안내 ----------------------------
 DEFAULT_URL = "https://www.youtube.com/watch?v=WXuK6gekU1Y"
 
-# ============================ 유틸 함수들 ============================
+# 대전제 충족: 필요한 라이브러리를 requirements.txt로 저장(자동 생성)
+REQUIREMENTS = "\n".join([
+    "streamlit",
+    "requests",
+    "pandas",
+    "altair",
+    "wordcloud",
+    "matplotlib",
+    "pillow",
+    "tzdata",
+])
+try:
+    with open("requirements.txt", "w", encoding="utf-8") as f:
+        f.write(REQUIREMENTS)
+except Exception:
+    pass
+
+# ---------------------------- 보조 함수들 ----------------------------
 def extract_video_id(url: str):
-    """여러 형태의 유튜브 주소에서 영상 ID를 뽑아요."""
+    """여러 형태의 유튜브 주소에서 영상 ID를 뽑아줘요."""
     if not url:
         return None
     url = url.strip()
@@ -35,40 +54,36 @@ def extract_video_id(url: str):
     path = parsed.path or ""
     qs = parse_qs(parsed.query or "")
 
+    # https://www.youtube.com/watch?v=VIDEO_ID
     if "youtube.com" in host:
         if "v" in qs and qs["v"]:
             return qs["v"][0]
+        # /embed/VIDEO_ID
         m = re.search(r"/embed/([A-Za-z0-9_-]{6,})", path)
         if m:
             return m.group(1)
+        # /shorts/VIDEO_ID
         m = re.search(r"/shorts/([A-Za-z0-9_-]{6,})", path)
         if m:
             return m.group(1)
+        # /live/VIDEO_ID
         m = re.search(r"/live/([A-Za-z0-9_-]{6,})", path)
         if m:
             return m.group(1)
+    # https://youtu.be/VIDEO_ID
     if "youtu.be" in host:
         m = re.match(r"^/([A-Za-z0-9_-]{6,})", path)
         if m:
             return m.group(1)
+
+    # 예외적으로 query에 vi=가 올 때
     if "vi" in qs and qs["vi"]:
         return qs["vi"][0]
     return None
 
 
-@st.cache_resource(show_spinner=False)
-def get_session() -> requests.Session:
-    """API 호출용 세션을 한 번 만들고 재사용해요."""
-    s = requests.Session()
-    s.headers.update({
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 (WordcloudApp/1.0)"
-    })
-    return s
-
-
 def raise_api_error(resp: requests.Response) -> None:
-    """API 오류를 사람이 이해하기 쉬운 예외로 바꿔요."""
+    """API 오류를 읽어서 예외로 올려줘요."""
     try:
         data = resp.json()
         reason = data.get("error", {}).get("errors", [{}])[0].get("reason", "")
@@ -79,22 +94,107 @@ def raise_api_error(resp: requests.Response) -> None:
     raise RuntimeError(f"{code}:{reason}")
 
 
-def fetch_video_title(api_key: str, video_id: str, session: requests.Session) -> str:
-    """영상 제목을 가져와요(파일명에 쓸 거예요)."""
-    url = "https://www.googleapis.com/youtube/v3/videos"
-    params = {"id": video_id, "part": "snippet", "key": api_key}
-    resp = session.get(url, params=params, timeout=20)
-    if resp.status_code != 200:
-        raise_api_error(resp)
-    items = resp.json().get("items", [])
+def sanitize_filename(name: str) -> str:
+    """파일명에서 금지 문자를 제거해요."""
+    return re.sub(r'[\\/:*?"<>|]+', "", name).strip() or "wordcloud"
+
+
+@st.cache_resource(show_spinner=False)
+def get_korean_font_path() -> str | None:
+    """나눔고딕 폰트를 웹에서 받아 임시 폴더에 저장하고 경로를 돌려줘요.
+    1차: GitHub Raw → 실패 시 2차: gstatic으로 재시도해요."""
+    # 캐시 디렉터리와 파일 경로
+    tmp_dir = tempfile.gettempdir()
+    font_path = os.path.join(tmp_dir, "NanumGothic.ttf")
+    if os.path.exists(font_path) and os.path.getsize(font_path) > 0:
+        return font_path
+
+    urls = [
+        # 1차: GitHub (Raw)
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf",
+        # 2차: gstatic 대체 URL
+        "https://fonts.gstatic.com/s/nanumgothic/v26/PN_3Rfi-oW3hYwmKDpxS7F_DpDmS.woff2",  # woff2이지만 일부 환경에서 변환 불가할 수 있어요
+    ]
+
+    # 다운로드 시도 (ttf 우선)
+    for i, u in enumerate(urls, start=1):
+        try:
+            r = requests.get(u, timeout=20)
+            if r.status_code == 200 and r.content:
+                # woff2인 경우에는 matplotlib에서 직접 사용이 어려울 수 있으므로 무시
+                if u.endswith(".woff2"):
+                    continue
+                with open(font_path, "wb") as f:
+                    f.write(r.content)
+                if os.path.getsize(font_path) > 0:
+                    return font_path
+        except Exception:
+            continue
+
+    return None
+
+
+def tokens_from_texts(texts: list[str], stop_en: set[str], stop_ko: set[str]) -> list[str]:
+    """특수문자/이모지를 제거하고, 2글자 이상 한글/영어 단어만 남겨요."""
+    all_tokens: list[str] = []
+    pat = re.compile(r"[a-zA-Z가-힣]{2,}")
+    for t in texts:
+        t = t.replace("\n", " ").lower()
+        toks = pat.findall(t)
+        # 불용어 제거
+        toks = [w for w in toks if (w not in stop_en and w not in stop_ko)]
+        all_tokens.extend(toks)
+    return all_tokens
+
+
+def build_wordcloud(tokens: list[str], max_words: int, font_path: str | None) -> BytesIO | None:
+    """토큰으로 워드클라우드를 만들고 PNG로 돌려줘요. 폰트가 없으면 None."""
+    if font_path is None:
+        return None
+    text = " ".join(tokens)
+    wc = WordCloud(
+        width=1600,
+        height=900,
+        background_color="white",
+        max_words=max_words,
+        font_path=font_path,
+        prefer_horizontal=0.9,
+        collocations=False,
+        margin=0,
+    ).generate(text)
+
+    # 여백 없이 저장
+    fig = plt.figure(figsize=(16, 9), dpi=100)
+    plt.imshow(wc, interpolation="bilinear")
+    plt.axis("off")
+    plt.margins(0, 0)
+    plt.tight_layout(pad=0)
+    buf = BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def fetch_comments_and_title(api_key: str, video_id: str, max_count: int):
+    """영상 제목과 인기순 댓글을 모아와요."""
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json"})
+
+    # 제목 가져오기
+    v_url = "https://www.googleapis.com/youtube/v3/videos"
+    v_params = {"id": video_id, "part": "snippet", "key": api_key}
+    v_resp = session.get(v_url, params=v_params, timeout=20)
+    if v_resp.status_code != 200:
+        raise_api_error(v_resp)
+    v_data = v_resp.json()
+    items = v_data.get("items", [])
     if not items:
         raise RuntimeError("404:notFound")
-    return items[0]["snippet"]["title"] or "video"
+    title = items[0]["snippet"].get("title", "video")
 
-
-def fetch_comment_texts(api_key: str, video_id: str, session: requests.Session, max_count: int) -> list[str]:
-    """인기순으로 댓글 본문을 최대 max_count개 모아요."""
-    url = "https://www.googleapis.com/youtube/v3/commentThreads"
+    # 댓글 가져오기(인기순)
+    c_url = "https://www.googleapis.com/youtube/v3/commentThreads"
     params = {
         "part": "snippet",
         "videoId": video_id,
@@ -103,213 +203,174 @@ def fetch_comment_texts(api_key: str, video_id: str, session: requests.Session, 
         "maxResults": 100,
         "textFormat": "plainText",
     }
-    texts: list[str] = []
+    comments = []
     page_token = None
     while True:
         if page_token:
             params["pageToken"] = page_token
         else:
             params.pop("pageToken", None)
-        resp = session.get(url, params=params, timeout=20)
+
+        resp = session.get(c_url, params=params, timeout=20)
         if resp.status_code != 200:
             raise_api_error(resp)
         data = resp.json()
         for it in data.get("items", []):
             try:
                 sn = it["snippet"]["topLevelComment"]["snippet"]
-                txt = (sn.get("textDisplay", "") or "").replace("\n", " ").strip()
-                if txt:
-                    texts.append(txt)
+                text = (sn.get("textDisplay", "") or "").replace("\n", " ").strip()
+                like_count = int(sn.get("likeCount", 0))
+                published_at = sn.get("publishedAt", "")
+                comments.append({"text": text, "like": like_count, "time": published_at})
             except Exception:
                 continue
-            if len(texts) >= max_count:
-                return texts
+            if len(comments) >= max_count:
+                return title, comments
         page_token = data.get("nextPageToken")
         if not page_token:
             break
-    return texts
+    return title, comments
 
-
-def sanitize_filename(name: str) -> str:
-    """파일명에 쓸 수 없는 문자를 제거해요."""
-    name = re.sub(r"[\\/*?:\"<>|]", "", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name or "wordcloud"
-
-
-def tokenize_clean(text: str) -> list[str]:
-    """특수문자/이모지 제거, 2글자 이상 한/영/숫자 단어만 남겨요."""
-    cleaned = re.sub(r"[^가-힣A-Za-z0-9\s]", " ", text)
-    cleaned = cleaned.lower()
-    tokens = re.findall(r"[가-힣a-z0-9]+", cleaned)
-    return [t for t in tokens if len(t) >= 2]
-
-
-# --------- 한글 기본 불용어(넉넉하게, 조사/대명사/추임새/상투어 포함) ----------
-BASE_KO_STOPWORDS = {
-    "그리고","그러나","하지만","그래서","또한","및","등","또","아니라","보다","위해","대한","때문","때문에","으로","으로써","으로서","에서",
-    "에게","에게서","부터","까지","이다","되다","하다","합니다","해요","한다","했다","하는","하면","하며","하여","하니","하고",
-    "됩니다","되는","되어","됐다","있다","없다","같다","수","것","거","들","그","이","저","그것","이것","저것","때","좀","아주","너무","매우",
-    "진짜","정말","그냥","아마","이미","다시","다른","최근","처럼","같이","우리","저희","내","내가","나","너","니","니가","너가","그녀",
-    "그는","그녀는","저는","나는","우리는","여러분","오늘","영상","댓글","유튜브","보기","요","네","죠","요즘","거의","현재","그게","이게","저게",
-    "뭔가","뭐","뭔","이런","저런","그런","뭔지","어떤","무엇","그래도","또는","만","라도","까지도","에서만","부터도","에는","이며","이나","라도요",
-    "ㅋㅋ","ㅎㅎ","ㅠㅠ","ㅜㅜ","ㅠ","ㅜ"
+# ---------------------------- 한글 불용어(120+) ----------------------------
+STOP_KO_BASE = {
+    "가","가까이","가령","각","각각","각자","각종","간","간단","간혹","갈수록","감사","갑자기","값","강","거","거기","거의","거나",
+    "건","것","게","게다가","겨우","결과","결국","결코","겸","경우","계속","고","고려","골","곧","곳","공","과","과거","과연","관계",
+    "관련","관해","교","구","구체","국","군데","권","그","그거","그것","그날","그냥","그녀","그들","그때","그래","그래서","그러나",
+    "그러면","그러므로","그런","그런데","그럴","그럼","그렇게","그룹","그만","그밖","그분","그야말로","그 owing","그전","그중","근거",
+    "근데","근본","근처","글쎄","금방","기간","긴","깊이","까닭","까지","나","나름","나머지","나아가","나중","남","너","너무","넣",
+    "네","년","녘","노","놀라","높","놓","누가","누구","눈","뉴스","느껴","느낌","늦게","다","다만","다소","다시","다양","단","단순",
+    "달","담","대","대로","대부분","대비","대신","대하여","대한","덜","데","도","도대체","도로","도로서","도움","동안","동시","동안에",
+    "뒤","드","든지","들","등","등등","딱","때","때문","또","또는","또한","라며","라서","로","로부터","로서","로나","로나마","롱","루",
+    "리","므로","마다","마냥","마저","마치","만","만나","만들","만약","만일","만큼","많이","말","말로","말하","맘","매우","머","먼저",
+    "멀리","며","면","면서","몇","모두","모든","모처럼","무엇","무슨","무척","문","문제","문화","및","바","바깥","바로","바탕","박",
+    "밖","반면","받","발","발견","발표","방금","방법","번","별","병","보고","보내","보다","보통","봄","부","부분","부족","뿐","뿐만",
+    "뿐이다","브","비","비롯","비해","빨리","사람","사실","사항","사이","사용","사이","사회","산","살짝","상","상관","상대","상당",
+    "상세","상태","상황","새","생각","생산","서로","서서히","선","선택","설명","성","세계","세","세대","센","소","소수","속","손","솔직",
+    "수","수준","순간","순서","쉽게","쉬운","스스로","습관","시간","시기","시대","시작","시점","시험","식","신","실","실제로","실제",
+    "심지어","싶","쓰","아","아까","아니","아니라","아닌","아니요","아마","아무","아예","아주","아직","안","안에","않","알","앞","약",
+    "약간","양","어느","어떤","어떻게","어때","어려","어울","어쩌면","어찌","언제","얼마","엄청","엉","에게","에게서","에서","여기",
+    "여러","여러분","여전히","여튼","연구","연속","열","영","예","예를","예술","예전","오늘","오래","오히려","와","왜","외","요","요즘",
+    "우","우리","우선","운","원","원래","원인","월","위","위해","유","육","은","은근","을","음","이","이것","이곳","이날","이다","이러",
+    "이런","이래서","이러면","이럴","이렇게","이번","이분","이상","이야","이야말로","이후","인","인해","일","일때","일부","일반","일부러",
+    "임","입장","자","자기","자꾸","자신","자신감","자리","자주","작","잔","잘","잠깐","장","저","저거","저것","저기","저녁","저러","저런",
+    "저렇게","저번","저분","적","전","전자","전체","전혀","전후","점","정도","정리","정말","정부","정의","정확","제","제대로","제일","조금",
+    "조차","존재","졸","좀","종","주","주의","줄","중","중간","중요","즉","지","지나","지난","지금","지만","지속","지역","지원","지적",
+    "진짜","질","쪽","차","차라리","참","창","찾","처","처음","처럼","천","첫","첫째","청","체","초","총","최고","최근","최대한","추가",
+    "추정","축","취지","측","층","취","치","친","카","크","큰","키","타","특별","특히","틈","파","편","평균","평소","포함","표","풀","프로",
+    "필요","하","하고","하게","하나","하니","한다","하는","하여","하지만","한","한번","한편","할","함","해","해서","해도","해도돼","해요",
+    "했던","했어요","했다","했는데","해야","호","혹시","혹은","혹","후","후에","훨씬"
 }
 
-# ============================ 폰트 경로(캐시) ============================
-@st.cache_resource(show_spinner=False)
-def get_korean_font_path() -> str:
-    """나눔고딕/노토산스KR 중 가능한 폰트를 내려받아 임시 폴더에 저장하고 경로를 돌려줘요. (인자 없음)"""
-    # 1) 로컬에 한글 폰트가 이미 있으면 그걸 사용
-    candidates_local = ["Malgun Gothic", "AppleGothic", "NanumGothic", "NanumSquare", "Noto Sans CJK KR", "Noto Sans KR"]
-    for f in font_manager.findSystemFonts(fontpaths=None, fontext="ttf") + font_manager.findSystemFonts(fontpaths=None, fontext="otf"):
-        try:
-            p = font_manager.FontProperties(fname=f)
-            name = font_manager.get_font(f).family_name
-        except Exception:
-            continue
-        if any(k in (name or "") for k in candidates_local):
-            return f
-
-    # 2) 웹에서 내려받기(여러 URL 후보를 순차 시도)
-    urls = [
-        # Noto Sans KR (공식 저장소 raw)
-        "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansKR-Regular.otf",
-        # NanumGothic (네이버 배포)
-        "https://github.com/naver/nanumfont/releases/download/VER2.5/NanumGothic.ttf",
-        # Noto Sans KR 또 다른 가중치
-        "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansKR-Medium.otf",
-    ]
-    session = get_session()
-    tmp_dir = tempfile.gettempdir()
-    for u in urls:
-        filename = os.path.basename(u.split("?")[0]) or "font.otf"
-        font_path = os.path.join(tmp_dir, filename)
-        try:
-            if not os.path.exists(font_path) or os.path.getsize(font_path) < 50000:
-                r = session.get(u, timeout=30)
-                r.raise_for_status()
-                if len(r.content) < 50000:
-                    continue
-                with open(font_path, "wb") as f:
-                    f.write(r.content)
-            # 간단 검증: matplotlib이 읽을 수 있나 확인
-            _ = font_manager.get_font(font_path)
-            return font_path
-        except Exception:
-            continue
-    return ""  # 모두 실패
-
-
-# ============================ 화면 구성 ============================
+# ---------------------------- UI ----------------------------
 api_key = st.secrets.get("youtube_api_key", "")
 if not api_key:
     st.error("🔐 API 키가 없어요. .streamlit/secrets.toml에 넣어 주세요.")
-url = st.text_input("📮 유튜브 주소", value=DEFAULT_URL, placeholder="예) https://youtu.be/VIDEO_ID 또는 https://www.youtube.com/watch?v=VIDEO_ID")
-max_comments = st.slider("🧲 최대 댓글 수 (인기순)", 100, 2000, 500, step=100)
-max_words = st.slider("🧱 워드클라우드 단어 수", 20, 200, 100, step=10)
+st.markdown("### ✏️ 입력 옵션")
 
-with st.expander("🧹 불용어 편집 (쉼표로 구분해서 추가해요)", expanded=False):
-    col_a, col_b = st.columns(2)
-    with col_a:
-        user_stop_en = st.text_area("🇺🇸 영어 불용어 추가", placeholder="ex) video, youtube, like")
-    with col_b:
-        user_stop_ko = st.text_area("🇰🇷 한글 불용어 추가", placeholder="ex) 정말, 그냥, 영상")
+with st.form("config_form"):
+    url_input = st.text_input(
+        "🔗 유튜브 주소",
+        value=DEFAULT_URL,
+        placeholder="예) https://youtu.be/VIDEO_ID 또는 https://www.youtube.com/watch?v=VIDEO_ID",
+    )
 
-go = st.button("🚀 워드클라우드 만들기", disabled=(not bool(api_key)))
+    c1, c2 = st.columns(2)
+    with c1:
+        max_comments = st.slider("🧮 최대 댓글 수 (100~2000)", 100, 2000, 1000, step=100)
+    with c2:
+        max_words = st.slider("☁️ 워드클라우드 단어 수 (20~200)", 20, 200, 100, step=10)
 
-# ============================ 동작 ============================
-if go:
-    video_id = extract_video_id(url)
+    with st.expander("📝 영어/한국어 불용어 편집 (쉼표 , 로 구분해요)", expanded=False):
+        s1, s2 = st.columns(2)
+        with s1:
+            user_en_stop = st.text_area("🇬🇧 영어 불용어 추가", placeholder="예) video, comment, like")
+        with s2:
+            user_ko_stop = st.text_area("🇰🇷 한글 불용어 추가", placeholder="예) 영상, 댓글, 좋아요")
+
+    submit = st.form_submit_button("▶ 워드클라우드 만들기", use_container_width=True, disabled=(not bool(api_key)))
+
+# ---------------------------- 실행 ----------------------------
+if submit:
+    # 주소 확인
+    video_id = extract_video_id(url_input)
     if not video_id:
-        st.error("❗ 주소가 올바르지 않아요.")
+        st.error("❌ 주소가 올바르지 않아요.")
         st.stop()
 
-    session = get_session()
+    # 불용어 합치기 (중복 자동 제거)
+    en_stop = set(WC_STOPWORDS)
+    if user_en_stop:
+        add_en = {w.strip().lower() for w in user_en_stop.split(",") if w.strip()}
+        en_stop |= add_en
+    ko_stop = set(w.lower() for w in STOP_KO_BASE)
+    if user_ko_stop:
+        add_ko = {w.strip().lower() for w in user_ko_stop.split(",") if w.strip()}
+        ko_stop |= add_ko
 
-    # 영상 제목
-    try:
-        with st.spinner("🔎 영상 정보를 확인하고 있어요..."):
-            title = fetch_video_title(api_key, video_id, session)
-    except Exception:
-        st.error("❌ 데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
-        st.stop()
-
-    # 댓글 수집
-    try:
-        with st.spinner("💬 댓글을 모으는 중이에요... (인기순)"):
-            texts = fetch_comment_texts(api_key, video_id, session, max_comments)
-    except Exception:
-        st.error("❌ 데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
-        st.stop()
-
-    if not texts:
-        st.warning("🪫 분석을 진행할 만큼의 단어를 찾지 못했어요.")
-        st.stop()
-
-    # 토큰화 + 불용어
-    with st.spinner("🧪 텍스트를 정리하는 중이에요..."):
-        tokens_all: list[str] = []
-        for t in texts:
-            tokens_all.extend(tokenize_clean(t))
-
-        stop_en = set(WC_STOPWORDS)
-        if user_stop_en:
-            stop_en |= {w.strip().lower() for w in user_stop_en.split(",") if w.strip()}
-
-        stop_ko = set(w.lower() for w in BASE_KO_STOPWORDS)
-        if user_stop_ko:
-            stop_ko |= {w.strip().lower() for w in user_stop_ko.split(",") if w.strip()}
-
-        all_stop = stop_en | stop_ko
-        tokens_valid = [w for w in tokens_all if w not in all_stop and len(w) >= 2]
-
-    if not tokens_valid:
-        st.info("ℹ️ 분석을 진행할 만큼의 단어를 찾지 못했어요.")
-        st.stop()
-
-    freq = Counter(tokens_valid)
-    if not freq:
-        st.info("ℹ️ 분석을 진행할 만큼의 단어를 찾지 못했어요.")
-        st.stop()
-
-    most = dict(freq.most_common(max_words))
-
-    # 폰트 준비(여러 경로 시도 후 실패 시 안내)
-    with st.spinner("🔤 한글 폰트를 준비하는 중이에요..."):
-        font_path = get_korean_font_path()
-        if not font_path or not os.path.exists(font_path):
-            st.error("⚠️ 폰트를 내려받지 못했어요. 한글이 깨질 수 있어 워드클라우드를 생략할게요.")
+    # 데이터 가져오기
+    with st.spinner("⏳ 데이터 가져오는 중이에요..."):
+        try:
+            title, comments = fetch_comments_and_title(api_key, video_id, max_comments)
+        except RuntimeError as e:
+            msg = str(e)
+            if ("403" in msg and ("commentsDisabled" in msg or "forbidden" in msg)) or "commentsDisabled" in msg:
+                st.error("🚫 이 영상은 댓글을 볼 수 없어요.")
+                st.stop()
+            if "quotaExceeded" in msg or "429" in msg:
+                st.error("⏱️ 오늘 사용할 수 있는 조회량이 다 됐어요.")
+                st.stop()
+            st.error("⚠️ 데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+            st.stop()
+        except Exception:
+            st.error("⚠️ 데이터를 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
             st.stop()
 
+    if not comments:
+        st.warning("ℹ️ 댓글이 없어요.")
+        st.stop()
+
+    # 표용 데이터프레임(원하는 경우 참고용으로 사용 가능)
+    df = pd.DataFrame(comments)
+    df.rename(columns={"text": "댓글 내용", "time": "작성 시각", "like": "좋아요 수"}, inplace=True)
+
+    # 토큰화 및 불용어 처리
+    with st.spinner("🧹 전처리와 단어 추출 중이에요..."):
+        texts = [c["text"] for c in comments if c.get("text")]
+        tokens = tokens_from_texts(texts, en_stop, ko_stop)
+
+    if len(tokens) == 0:
+        st.warning("🫥 분석을 진행할 만큼의 단어를 찾지 못했어요.")
+        st.stop()
+
+    # 폰트 준비
+    with st.spinner("🔤 한글 폰트 준비 중이에요..."):
+        font_path = get_korean_font_path()
+        if font_path:
+            try:
+                plt.rcParams["font.family"] = "NanumGothic"
+                plt.rcParams["font.sans-serif"] = ["NanumGothic"]
+            except Exception:
+                pass
+
     # 워드클라우드 생성
-    with st.spinner("🎨 워드클라우드를 만드는 중이에요..."):
-        wc = WordCloud(
-            width=1200,
-            height=600,
-            background_color="white",
-            font_path=font_path,
-            max_words=max_words,
-            collocations=False,
-            prefer_horizontal=0.9,
-            regexp=r"[가-힣a-z0-9]+",
-        ).generate_from_frequencies(most)
+    with st.spinner("☁️ 워드클라우드 만드는 중이에요..."):
+        img_buf = build_wordcloud(tokens, max_words=max_words, font_path=font_path)
 
-        fig = plt.figure(figsize=(12, 6), dpi=150)
-        plt.imshow(wc, interpolation="bilinear")
-        plt.axis("off")
-        plt.tight_layout(pad=0)
+    if img_buf is None:
+        st.info("🪄 폰트를 준비하지 못해 워드클라우드 생성을 건너뛰었어요. 불용어를 조정해 다시 시도해 주세요.")
+        st.stop()
 
+    # 화면 표시
     st.success("✅ 워드클라우드를 만들었어요!")
-    st.image(wc.to_array(), use_column_width=True, caption="☁️ 워드클라우드")
+    st.image(img_buf, caption="워드클라우드", use_column_width=True)
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
-    buf.seek(0)
-    safe_name = sanitize_filename(title)
+    # 파일명 정리 후 다운로드 버튼 제공
+    clean_title = sanitize_filename(title)
+    file_name = f"{clean_title or 'wordcloud'}.png"
     st.download_button(
-        "⬇️ PNG로 내려받기",
-        data=buf,
-        file_name=f"{safe_name}_wordcloud.png",
+        "⬇️ 워드클라우드 PNG 내려받기",
+        data=img_buf,
+        file_name=file_name,
         mime="image/png",
+        use_container_width=True,
     )
